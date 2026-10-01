@@ -302,6 +302,133 @@ class StockCheckLine(Base):
     )
 
 
+class Shipment(Base):
+    """客户发货单：凭唯一发货单号一次提交多条互异（批次, 库位）行。
+
+    整单确认时在同一事务内原子扣减各库位余额与批次全局余量。隔离批次
+    （含疑似）与已撤销产出不得发货；发货后才隔离的批次仍可退货。
+    单号全局唯一、不得复用；成功单据与其逐行记录只追加、不可修改。
+    状态 SHIPPED / PARTIALLY_RETURNED / FULLY_RETURNED 在每次退货后重算。
+    """
+
+    __tablename__ = "shipments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shipment_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # SHIPPED（全部行未退）/ PARTIALLY_RETURNED（有退回但未全退）/
+    # FULLY_RETURNED（全部行累计退回恰等于发出）
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="SHIPPED")
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    lines: Mapped[list["ShipmentLine"]] = relationship(
+        back_populates="shipment", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_shipments_created", "created_at"),
+    )
+
+
+class ShipmentLine(Base):
+    """发货单行：某批次从某库位发出的一笔正数数量（不可变快照）。
+
+    同一发货单内 (批次, 库位) 必须互异；行号 line_no 从 1 开始、在单内
+    稳定，退货凭它引用“原行”。unit 取发货时刻批次单位一并固化。
+    累计退回量由 return_order_lines 聚合得到，逐次退货只追加。
+    """
+
+    __tablename__ = "shipment_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shipment_id: Mapped[int] = mapped_column(
+        ForeignKey("shipments.id", ondelete="CASCADE"), nullable=False
+    )
+    line_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    location_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    shipment: Mapped[Shipment] = relationship(back_populates="lines")
+    batch: Mapped[Batch] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("shipment_id", "line_no", name="uq_shipment_line_no"),
+        UniqueConstraint(
+            "shipment_id", "batch_no", "location_code",
+            name="uq_shipment_line_batch_loc",
+        ),
+        CheckConstraint("line_no >= 1", name="ck_shipment_line_no_positive"),
+        CheckConstraint("qty > 0", name="ck_shipment_line_qty_positive"),
+        Index("ix_shipment_line_batch", "batch_no"),
+    )
+
+
+class ReturnOrder(Base):
+    """客户退货单：凭唯一退货单号对一张原发货单的若干原行退回正数数量。
+
+    退货原子返还到原批次、原库位；同单内原行不得重复，累计退回不得超过
+    原行发出量。退货逐次追加、只增不改。退货单号全局唯一、不得复用。
+    隔离（含发货后才隔离）的批次仍可退货，返还后继续隔离。
+    """
+
+    __tablename__ = "return_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    return_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # 引用原发货单号（shipments.shipment_no 唯一，可作外键目标）
+    shipment_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("shipments.shipment_no"), nullable=False
+    )
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    lines: Mapped[list["ReturnOrderLine"]] = relationship(
+        back_populates="return_order", cascade="all, delete-orphan"
+    )
+
+    shipment: Mapped[Shipment] = relationship()
+
+    __table_args__ = (
+        Index("ix_return_orders_shipment", "shipment_no"),
+    )
+
+
+class ReturnOrderLine(Base):
+    """退货单行：对某条原发货行的一次正数退回（只追加）。
+
+    同一退货单内一条原发货行至多出现一次；该原行全部退货行的数量之和
+    不得超过其发出量（服务层在原发货单串行化锁下校验）。
+    """
+
+    __tablename__ = "return_order_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    return_id: Mapped[int] = mapped_column(
+        ForeignKey("return_orders.id", ondelete="CASCADE"), nullable=False
+    )
+    shipment_line_id: Mapped[int] = mapped_column(
+        ForeignKey("shipment_lines.id"), nullable=False
+    )
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+
+    return_order: Mapped[ReturnOrder] = relationship(back_populates="lines")
+    shipment_line: Mapped[ShipmentLine] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "return_id", "shipment_line_id", name="uq_return_line_original"
+        ),
+        CheckConstraint("qty > 0", name="ck_return_line_qty_positive"),
+        Index("ix_return_line_shipment_line", "shipment_line_id"),
+    )
+
+
 class BatchReview(Base):
     """质检复核记录：确认某疑似批次为误报后撤销其疑似标记。
 

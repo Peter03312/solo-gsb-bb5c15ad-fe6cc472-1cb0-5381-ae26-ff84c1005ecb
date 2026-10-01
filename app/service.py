@@ -25,6 +25,10 @@ from .models import (
     Production,
     ProductionInput,
     ProductionInputLocation,
+    ReturnOrder,
+    ReturnOrderLine,
+    Shipment,
+    ShipmentLine,
     StockCheck,
     StockCheckLine,
     StockTransfer,
@@ -33,7 +37,10 @@ from .schemas import (
     CancelIn,
     ProductionIn,
     RawBatchIn,
+    ReturnIn,
     ReviewIn,
+    ShipmentIn,
+    ShipmentLineIn,
     SplitIn,
     StockCheckIn,
     StockCheckLineIn,
@@ -824,6 +831,376 @@ def get_stock_check(session: Session, stock_check_no: str) -> dict[str, Any]:
     return _stock_check_out(check)
 
 
+# ---------------------------------------------------------------- 客户发货
+
+
+def _iso_utc(dt: object) -> str:
+    """naive（SQLite）时间统一当作 UTC 输出 ISO 8601。"""
+    if dt is not None and getattr(dt, "tzinfo", None) is None:
+        dt = dt.replace(tzinfo=timezone.utc)  # type: ignore[union-attr]
+    return dt.isoformat() if dt is not None else None  # type: ignore[union-attr]
+
+
+def _line_return_status(shipped: Decimal, returned: Decimal) -> str:
+    if returned >= shipped:
+        return "FULLY_RETURNED"
+    if returned > 0:
+        return "PARTIALLY_RETURNED"
+    return "SHIPPED"
+
+
+def _returned_qty_by_line(
+    session: Session, shipment_line_ids: list[int]
+) -> dict[int, Decimal]:
+    """各发货行截至当前的累计退回量（退货行只追加，SUM 聚合）。"""
+    if not shipment_line_ids:
+        return {}
+    rows = session.execute(
+        select(ReturnOrderLine.shipment_line_id, func.coalesce(func.sum(ReturnOrderLine.qty), 0))
+        .where(ReturnOrderLine.shipment_line_id.in_(shipment_line_ids))
+        .group_by(ReturnOrderLine.shipment_line_id)
+    ).all()
+    return {line_id: Decimal(qty) for line_id, qty in rows}
+
+
+def _shipment_view(session: Session, shipment: Shipment) -> dict[str, Any]:
+    """组装发货单查询响应：整单状态、逐行发出/累计退回/可退量与逐次退货记录。"""
+    lines = sorted(shipment.lines, key=lambda x: x.line_no)
+    returned_map = _returned_qty_by_line(session, [line.id for line in lines])
+
+    line_views: list[dict[str, Any]] = []
+    any_return = False
+    all_full = True
+    for line in lines:
+        shipped = Decimal(line.qty)
+        returned = returned_map.get(line.id, Decimal("0"))
+        line_status = _line_return_status(shipped, returned)
+        if returned > 0:
+            any_return = True
+        if line_status != "FULLY_RETURNED":
+            all_full = False
+        line_views.append(
+            {
+                "line_no": line.line_no,
+                "batch_no": line.batch_no,
+                "location_code": line.location_code,
+                "unit": line.unit,
+                "shipped_qty": float(shipped),
+                "returned_qty": float(returned),
+                "returnable_qty": float(shipped - returned),
+                "status": line_status,
+            }
+        )
+
+    # 全部行全退 -> FULLY_RETURNED；有任一行退回（但未全退）-> PARTIALLY_RETURNED
+    if all_full:
+        overall = "FULLY_RETURNED"
+    elif any_return:
+        overall = "PARTIALLY_RETURNED"
+    else:
+        overall = "SHIPPED"
+
+    returns = session.execute(
+        select(ReturnOrder)
+        .options(selectinload(ReturnOrder.lines).selectinload(ReturnOrderLine.shipment_line))
+        .where(ReturnOrder.shipment_no == shipment.shipment_no)
+        .order_by(ReturnOrder.created_at, ReturnOrder.id)
+    ).scalars().all()
+    return_views: list[dict[str, Any]] = []
+    for ret in returns:
+        ret_lines = sorted(ret.lines, key=lambda x: x.shipment_line.line_no)
+        return_views.append(
+            {
+                "return_no": ret.return_no,
+                "shipment_no": ret.shipment_no,
+                "returned_at": _iso_utc(ret.created_at),
+                "lines": [
+                    {
+                        "line_no": rl.shipment_line.line_no,
+                        "batch_no": rl.shipment_line.batch_no,
+                        "location_code": rl.shipment_line.location_code,
+                        "unit": rl.shipment_line.unit,
+                        "quantity": float(rl.qty),
+                    }
+                    for rl in ret_lines
+                ],
+            }
+        )
+
+    return {
+        "shipment_no": shipment.shipment_no,
+        "status": overall,
+        "shipped_at": _iso_utc(shipment.created_at),
+        "lines": line_views,
+        "returns": return_views,
+    }
+
+
+def _quarantined_shipment_error(batch_no: str) -> errors.AppError:
+    """发货场景的隔离拒绝：错误码沿用 BATCH_QUARANTINED，消息贴合发货。"""
+    return errors.AppError(
+        "BATCH_QUARANTINED",
+        f"批次 {batch_no!r} 已隔离，隔离或已撤销产出不可发货",
+        409,
+        details={"batch_no": batch_no},
+    )
+
+
+def submit_shipment(session: Session, data: ShipmentIn) -> dict[str, Any]:
+    """客户发货：整单确认时原子扣减各库位与批次全局余量。
+
+    校验顺序（任一不符整单拒绝、无任何部分变更）：
+    1. 同单内（批次, 库位）互异（DUPLICATE_SHIPMENT_LINE 422）；
+    2. 发货单号未被占用（SHIPMENT_NO_REUSED 409，单号全局不得复用）；
+    3. 每个批次存在（SOURCE_NOT_FOUND 404）；
+    4. 批次非已撤销产出（BATCH_CANCELLED 409）且未隔离
+       （BATCH_QUARANTINED 409，含疑似）——隔离或已撤销产出不可发货；
+    5. 逐行：发货库位存在（LOCATION_NOT_FOUND 404）且该库位余额不少于
+       发货量（INSUFFICIENT_BALANCE 409，details 带库位编号）；不做跨库位
+       分配，库位不足即使全局余量充足也整单拒绝。
+
+    全部通过后同事务：逐行扣减库位行与批次全局余量（各库位之和恒等于
+    全局余量），写入只追加的发货单头与逐行快照（单位取批次单位）。
+
+    并发：沿用全局统一两级加锁顺序——先按批次编号升序锁批次行，再在每个
+    批次内按库位编号升序锁库位行（PG FOR UPDATE；SQLite 为
+    BEGIN IMMEDIATE 全库串行）。发货与投料、分装、调拨、盘点、退货、QC
+    任意并发都不会超扣，两层恒等式恒成立。
+    """
+    pairs = [(line.batch_no, line.location_code) for line in data.lines]
+    if len(set(pairs)) != len(pairs):
+        seen: set[tuple[str, str]] = set()
+        for batch_no, location_code in pairs:
+            if (batch_no, location_code) in seen:
+                raise errors.duplicate_shipment_line(batch_no, location_code)
+            seen.add((batch_no, location_code))
+
+    existing_shipment = session.execute(
+        select(Shipment.id).where(Shipment.shipment_no == data.shipment_no)
+    ).scalar_one_or_none()
+    if existing_shipment is not None:
+        raise errors.shipment_no_exists(data.shipment_no)
+
+    batch_nos = [batch_no for batch_no, _ in pairs]
+    locked_batches = _lock_batches_in_order(session, batch_nos)
+
+    # 逐批做存在性 / 可发货状态校验
+    cancelled_nos = _cancelled_output_nos(session, batch_nos)
+    by_batch: dict[str, list[ShipmentLineIn]] = {}
+    for line in data.lines:
+        batch = locked_batches.get(line.batch_no)
+        if batch is None:
+            raise errors.batch_not_found(line.batch_no)
+        if line.batch_no in cancelled_nos:
+            raise errors.batch_cancelled(line.batch_no)
+        if batch.is_quarantined:
+            raise _quarantined_shipment_error(line.batch_no)
+        by_batch.setdefault(line.batch_no, []).append(line)
+
+    # 先统一锁定/校验全部库位行并检查余额，全部通过后才允许任何写入。
+    location_rows: dict[tuple[str, str], BatchLocation] = {}
+    for batch_no in sorted(by_batch):
+        codes = [line.location_code for line in by_batch[batch_no]]
+        rows = _lock_locations(session, batch_no, codes)
+        for line in by_batch[batch_no]:
+            loc_row = rows.get(line.location_code)
+            if loc_row is None:
+                raise errors.location_not_found(batch_no, line.location_code)
+            if line.quantity > loc_row.qty:
+                raise errors.insufficient(
+                    batch_no, line.quantity, loc_row.qty,
+                    location_code=line.location_code,
+                )
+            location_rows[(batch_no, line.location_code)] = loc_row
+
+    # 建单头（尽早暴露并发抢号），唯一约束再兜底一次
+    shipment = Shipment(shipment_no=data.shipment_no, status="SHIPPED")
+    session.add(shipment)
+    try:
+        session.flush()
+    except IntegrityError:
+        raise errors.shipment_no_exists(data.shipment_no) from None
+
+    for line_no, line in enumerate(data.lines, start=1):
+        batch = locked_batches[line.batch_no]
+        location_rows[(line.batch_no, line.location_code)].qty -= line.quantity
+        batch.remaining_qty -= line.quantity
+        session.add(
+            ShipmentLine(
+                shipment_id=shipment.id,
+                line_no=line_no,
+                batch_no=line.batch_no,
+                location_code=line.location_code,
+                qty=line.quantity,
+                unit=batch.unit,
+            )
+        )
+
+    session.flush()
+    return _shipment_view(session, shipment)
+
+
+def get_shipment(session: Session, shipment_no: str) -> dict[str, Any]:
+    """按发货单号查询：整单状态、逐行发出/累计退回/可退量与逐次退货记录。
+
+    单号不存在（失败提交不留记录）-> SHIPMENT_NOT_FOUND(404)。
+    """
+    shipment = session.execute(
+        select(Shipment)
+        .options(selectinload(Shipment.lines))
+        .where(Shipment.shipment_no == shipment_no)
+    ).scalar_one_or_none()
+    if shipment is None:
+        raise errors.shipment_not_found(shipment_no)
+    return _shipment_view(session, shipment)
+
+
+# ---------------------------------------------------------------- 客户退货
+
+
+def submit_return(session: Session, data: ReturnIn) -> dict[str, Any]:
+    """客户退货：凭原发货单号 + 唯一退货单号，对若干原行原子退回正数数量。
+
+    规则（任一不符整单拒绝、无任何部分变更）：
+    1. 同单内原行号互异（DUPLICATE_RETURN_LINE 422）；
+    2. 退货单号未被占用（RETURN_NO_REUSED 409，单号全局不得复用）；
+    3. 原发货单存在（SHIPMENT_NOT_FOUND 404）；先锁发货单头，使同一发货单
+       的并发退货全局串行，累计退回绝不可能超过原行发出量；
+    4. 每个原行号在该发货单内存在（SHIPMENT_LINE_NOT_FOUND 404）；
+    5. 逐行累计退回（含本次）不超过原行发出量
+       （RETURN_EXCEEDS_SHIPPED 409，details 带已退/可退量）。
+
+    返还严格回原批次、原库位：库位行不存在（数据异常）时幂等补零行；
+    返还后批次余量可能高于当前量但不超过 initial_qty（退货量来自此前的
+    发货扣减）。发货后才隔离的批次仍可退货——退货不检查隔离/撤销状态，
+    返还到原批次后该批次继续隔离。
+
+    并发：先锁原发货单头串行化同单退货，再按批次编号升序、库位编号升序
+    锁库存，与发货/投料/分装/调拨/盘点共用同一全局加锁顺序；任意并发
+    组合都不会超退、超扣或使两层余额失配（PG FOR UPDATE；SQLite 为
+    BEGIN IMMEDIATE 全库串行）。
+    """
+    line_nos = [line.line_no for line in data.lines]
+    if len(set(line_nos)) != len(line_nos):
+        dup = next(no for no in line_nos if line_nos.count(no) > 1)
+        raise errors.duplicate_return_line(dup)
+
+    existing_return = session.execute(
+        select(ReturnOrder.id).where(ReturnOrder.return_no == data.return_no)
+    ).scalar_one_or_none()
+    if existing_return is not None:
+        raise errors.return_no_exists(data.return_no)
+
+    # 锁发货单头：同一张发货单上的退货严格串行（PG 行锁；SQLite 全库写锁）。
+    stmt = select(Shipment).where(Shipment.shipment_no == data.shipment_no)
+    if session.get_bind().dialect.name == "postgresql":
+        stmt = stmt.with_for_update()
+    shipment = session.execute(
+        stmt.options(selectinload(Shipment.lines))
+    ).scalar_one_or_none()
+    if shipment is None:
+        raise errors.shipment_not_found(data.shipment_no)
+
+    lines_by_no = {line.line_no: line for line in shipment.lines}
+    targets: list[tuple[Any, Any]] = []
+    requested_by_line: dict[int, Decimal] = {}
+    for line in data.lines:
+        shipment_line = lines_by_no.get(line.line_no)
+        if shipment_line is None:
+            raise errors.shipment_line_not_found(data.shipment_no, line.line_no)
+        targets.append((line, shipment_line))
+        requested_by_line[line.line_no] = line.quantity
+
+    # 锁原发货行（同一发货单的退货已被单头锁串行，FOR UPDATE 为一致性双保险）
+    line_ids = [sl.id for _, sl in targets]
+    if session.get_bind().dialect.name == "postgresql" and line_ids:
+        session.execute(
+            select(ShipmentLine).where(ShipmentLine.id.in_(line_ids)).with_for_update()
+        ).scalars().all()
+
+    returned_map = _returned_qty_by_line(session, line_ids)
+    # 超退校验：本单内同原行不重复，故无需累计本次请求
+    for line, shipment_line in targets:
+        shipped = Decimal(shipment_line.qty)
+        already = returned_map.get(shipment_line.id, Decimal("0"))
+        if already + line.quantity > shipped:
+            raise errors.return_exceeds_shipped(
+                data.shipment_no, line.line_no, line.quantity, shipped, already
+            )
+
+    # 按全局统一顺序锁原批次、原库位（批次编号升序 -> 库位编号升序）。
+    # 发货后才隔离的批次仍可退货：退货不判定 is_quarantined / is_cancelled。
+    batch_nos = sorted({sl.batch_no for _, sl in targets})
+    locked_batches = _lock_batches_in_order(session, batch_nos)
+    needed_locations: dict[str, set[str]] = {}
+    for _, sl in targets:
+        needed_locations.setdefault(sl.batch_no, set()).add(sl.location_code)
+    locked_locations: dict[str, dict[str, BatchLocation]] = {}
+    for batch_no in sorted(needed_locations):
+        codes = sorted(needed_locations[batch_no])
+        # 防御：原库位行必然存在（发货时即扣减）；异常缺失时补零行再锁。
+        _ensure_location_rows(session, batch_no, codes)
+        locked_locations[batch_no] = _lock_locations(session, batch_no, codes)
+
+    return_order = ReturnOrder(
+        return_no=data.return_no, shipment_no=data.shipment_no
+    )
+    session.add(return_order)
+    try:
+        session.flush()  # 尽早暴露并发抢号
+    except IntegrityError:
+        raise errors.return_no_exists(data.return_no) from None
+
+    for line, shipment_line in targets:
+        locked_batches[shipment_line.batch_no].remaining_qty += line.quantity
+        locked_locations[shipment_line.batch_no][shipment_line.location_code].qty += (
+            line.quantity
+        )
+        session.add(
+            ReturnOrderLine(
+                return_id=return_order.id,
+                shipment_line_id=shipment_line.id,
+                qty=line.quantity,
+            )
+        )
+
+    session.flush()
+
+    # 重算并固化发货单头状态
+    view = _shipment_view(session, shipment)
+    shipment.status = view["status"]
+    session.flush()
+
+    new_returned = {
+        sl.id: returned_map.get(sl.id, Decimal("0")) + requested_by_line[sl.line_no]
+        for _, sl in targets
+    }
+    result_lines = []
+    for _, sl in sorted(targets, key=lambda t: t[1].line_no):
+        shipped = Decimal(sl.qty)
+        returned_total = new_returned[sl.id]
+        result_lines.append(
+            {
+                "line_no": sl.line_no,
+                "batch_no": sl.batch_no,
+                "location_code": sl.location_code,
+                "unit": sl.unit,
+                "quantity": float(requested_by_line[sl.line_no]),
+                "returned_qty": float(returned_total),
+                "returnable_qty": float(shipped - returned_total),
+                "status": _line_return_status(shipped, returned_total),
+            }
+        )
+
+    return {
+        "return_no": data.return_no,
+        "shipment_no": data.shipment_no,
+        "shipment_status": view["status"],
+        "returned_at": _iso_utc(return_order.created_at),
+        "lines": result_lines,
+    }
+
+
 # ---------------------------------------------------------------- 生产单撤销
 
 
@@ -866,6 +1243,7 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     3b. 产出从未被分装（一旦分装即视为曾被使用，即使子批次尚未投料）；
     4. 产出当前非疑似（自身 is_suspect 为假；仅因疑似祖先被连带隔离不阻止撤销）；
     5. 产出无质检复核记录。
+    6. 产出从未发货（一旦发货即使全部退回也不得撤销原生产单）。
 
     通过后在同一事务内：
     - 各来源批次余量按“原投料量”返还（来源即使已隔离也照常返还，返还不会
@@ -930,6 +1308,18 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     loss_check_nos = sorted({row[0] for row in loss_rows})
     if loss_check_nos:
         raise errors.output_has_stock_loss(output_no, loss_check_nos)
+
+    # 产出一旦发货即不可撤销原生产单——即使全部退回也不可以。
+    # 发货是货物已离厂对外交付的既成事实；退货返还库存并不让生产单回到
+    # “录入错误可作废”的状态。按保留的发货行严格判定。
+    shipment_rows = session.execute(
+        select(Shipment.shipment_no)
+        .join(ShipmentLine, ShipmentLine.shipment_id == Shipment.id)
+        .where(ShipmentLine.batch_no == output_no)
+    ).all()
+    shipment_nos = sorted({row[0] for row in shipment_rows})
+    if shipment_nos:
+        raise errors.output_already_shipped(output_no, shipment_nos)
 
     # 产出当前非疑似（仅因疑似祖先被隔离不阻止撤销）
     if output_batch.is_suspect:

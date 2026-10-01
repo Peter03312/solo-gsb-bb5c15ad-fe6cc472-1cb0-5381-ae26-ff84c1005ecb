@@ -21,8 +21,12 @@ from .schemas import (
     ProductionOut,
     ProductionRecordOut,
     RawBatchIn,
+    ReturnIn,
+    ReturnOut,
     ReviewIn,
     ReviewOut,
+    ShipmentIn,
+    ShipmentOut,
     SplitIn,
     SplitOut,
     StockCheckIn,
@@ -298,6 +302,87 @@ def create_stock_check(
 def get_stock_check(stock_check_no: str, session: SessionDep) -> dict[str, Any]:
     """按单号查询盘点单：状态及逐行原值、差额与单位。"""
     return service.get_stock_check(session, stock_check_no)
+
+
+@router.post("/shipments", response_model=ShipmentOut, status_code=status.HTTP_201_CREATED)
+def create_shipment(
+    body: ShipmentIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """客户发货：凭唯一发货单号一次提交多条互异（批次, 库位）正数行。
+
+    整单确认时原子扣减各库位及批次全局余量；隔离批次（含疑似）与已撤销
+    产出不可发货。任一不符整单拒绝、无部分变更。必须携带幂等键。
+    """
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_201_CREATED, service.submit_shipment(session, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
+@router.get("/shipments/{shipment_no}", response_model=ShipmentOut)
+def get_shipment(shipment_no: str, session: SessionDep) -> dict[str, Any]:
+    """按发货单号查询：整单状态、逐行发出量/累计退回量/可退量与逐次退货记录。"""
+    return service.get_shipment(session, shipment_no)
+
+
+@router.post("/returns", response_model=ReturnOut, status_code=status.HTTP_201_CREATED)
+def create_return(
+    body: ReturnIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """客户退货：凭原发货单号 + 唯一退货单号，对若干原行退回正数数量。
+
+    原子返还到原批次、原库位；同单原行不得重复，累计退回不得超过原行
+    发出量。发货后才隔离的批次仍可退货，返还后继续隔离。任一不符整单
+    拒绝、无部分变更。必须携带幂等键。
+    """
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_201_CREATED, service.submit_return(session, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
 
 
 @router.post("/contamination", response_model=DescendantsOut, status_code=status.HTTP_200_OK)

@@ -156,6 +156,51 @@ class StockCheckIn(BaseModel):
     lines: list[StockCheckLineIn] = Field(min_length=1)
 
 
+class ShipmentLineIn(BaseModel):
+    """发货一行：批次 + 发货库位 + 正数数量。
+
+    同一发货单内（批次, 库位）必须互异（服务层兜底报
+    DUPLICATE_SHIPMENT_LINE 422）。发货严格从所给库位扣减（不做跨库位
+    分配）：库位不存在报 404，该库位余额不足报 409，整单拒绝。
+    """
+
+    batch_no: BatchNo
+    location_code: LocationCode
+    quantity: PositiveQty
+
+
+class ShipmentIn(BaseModel):
+    """客户发货：凭唯一发货单号一次提交多条互异（批次, 库位）正数行。"""
+
+    shipment_no: Annotated[
+        str, Field(min_length=1, max_length=64, examples=["SH-20261001-01"])
+    ]
+    lines: list[ShipmentLineIn] = Field(min_length=1)
+
+
+class ReturnLineIn(BaseModel):
+    """退货一行：引用原发货单内的行号（从 1 开始）+ 本次正数退回量。
+
+    同一退货单内 line_no 必须互异（服务层兜底报 DUPLICATE_RETURN_LINE
+    422）；累计退回不得超过原行发出量（RETURN_EXCEEDS_SHIPPED 409）。
+    """
+
+    line_no: int = Field(ge=1)
+    quantity: PositiveQty
+
+
+class ReturnIn(BaseModel):
+    """客户退货：凭原发货单号 + 唯一退货单号，对若干原行退回正数数量。"""
+
+    return_no: Annotated[
+        str, Field(min_length=1, max_length=64, examples=["RT-20261001-01"])
+    ]
+    shipment_no: Annotated[
+        str, Field(min_length=1, max_length=64, examples=["SH-20261001-01"])
+    ]
+    lines: list[ReturnLineIn] = Field(min_length=1)
+
+
 class ReviewIn(BaseModel):
     batch_no: BatchNo
     review_note: str = Field(min_length=1, max_length=1000, examples=["复检合格：留样复测未检出农残"])
@@ -352,3 +397,75 @@ class StockCheckOut(BaseModel):
     status: str
     checked_at: str
     lines: list[StockCheckLineOut]
+
+
+class ShipmentLineOut(BaseModel):
+    """发货单行视图：逐行发出量、累计退回量、可退量、单位与行状态。
+
+    可退量 returnable_qty = shipped_qty - returned_qty；行状态为
+    SHIPPED（未退）/ PARTIALLY_RETURNED（部分退回）/ FULLY_RETURNED（全退回）。
+    """
+
+    line_no: int
+    batch_no: str
+    location_code: str
+    unit: str
+    shipped_qty: float
+    returned_qty: float
+    returnable_qty: float
+    status: str
+
+
+class ReturnRecordLineOut(BaseModel):
+    """退货记录中的一行：原行号、本次退回量及退回时原行批次/库位。"""
+
+    line_no: int
+    batch_no: str
+    location_code: str
+    unit: str
+    quantity: float
+
+
+class ReturnRecordOut(BaseModel):
+    """一张退货单的逐次退货记录（按提交时间先后返回）。"""
+
+    return_no: str
+    shipment_no: str
+    returned_at: str
+    lines: list[ReturnRecordLineOut]
+
+
+class ShipmentOut(BaseModel):
+    """发货单：单号、整单状态、发货时间、逐行发出/退回/可退量与退货记录。
+
+    整单状态取值 SHIPPED / PARTIALLY_RETURNED / FULLY_RETURNED。
+    """
+
+    shipment_no: str
+    status: str
+    shipped_at: str
+    lines: list[ShipmentLineOut]
+    returns: list[ReturnRecordOut]
+
+
+class ReturnLineOut(BaseModel):
+    """退货提交结果中的一行：原行号、本次退回量与退货后该原行累计退回/可退量。"""
+
+    line_no: int
+    batch_no: str
+    location_code: str
+    unit: str
+    quantity: float
+    returned_qty: float
+    returnable_qty: float
+    status: str
+
+
+class ReturnOut(BaseModel):
+    """退货结果：退货单号、原发货单号、整单状态与逐行退回结果。"""
+
+    return_no: str
+    shipment_no: str
+    shipment_status: str
+    returned_at: str
+    lines: list[ReturnLineOut]

@@ -2,7 +2,7 @@
 
 面向小型食品加工厂的**本地批次追溯服务**：登记原料批次、记录生产投料与产出、
 把批次分装为可独立投料的子批次、按**库位**核算与调拨批次库存、对账实不符的
-批次库位做**盘点盘亏核销**、查询批次余量
+批次库位做**盘点盘亏核销**、按发货单对客户**发货并支持逐次退货**、查询批次余量
 （全局 + 逐库位）与上下游谱系，并在发现疑似污染批次时沿投料与分装关系找出并
 隔离全部后代产出。
 
@@ -85,6 +85,9 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 | POST | `/transfers` | 库位调拨：同一批次在两个不同库位间移动正数数量 |
 | POST | `/stock-checks` | 仓库盘点：凭唯一盘点单号提交多行盘亏核销，按差额扣减库位与全局余量 |
 | GET | `/stock-checks/{stock_check_no}` | 查询盘点单状态及逐行原值、差额与单位 |
+| POST | `/shipments` | 客户发货：凭唯一发货单号提交多条互异（批次, 库位）正数行，整单原子扣减 |
+| GET | `/shipments/{shipment_no}` | 查询发货单：整单状态、逐行发出量/累计退回量/可退量与逐次退货记录 |
+| POST | `/returns` | 客户退货：凭原发货单号 + 唯一退货单号对若干原行退回正数数量，原子返还原批次原库位 |
 | GET | `/batches/{batch_no}/locations` | 查询批次逐库位余额（各库位之和等于全局余量） |
 | POST | `/productions/{output_no}/cancellation` | 撤销录入错误的生产单：按原消耗库位返还、作废产出与投料边 |
 | GET | `/productions/{output_no}` | 按产出编号查询生产原单据（含撤销状态/原因） |
@@ -242,6 +245,49 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
       覆盖新余额；两个相同盘点单号并发时唯一约束兜底，恰好一笔成功。
     - 幂等沿用既有 `Idempotency-Key` 规则：同键同体重放返回首次结果、
       差额只扣一次，同键异体 `409 IDEMPOTENCY_CONFLICT`，失败不固化可重试。
+14. **客户发货与退货（shipment / return）**：货物离厂交付与售后退回的两层库存单据。
+    - **发货** `POST /shipments`：凭**唯一发货单号**一次提交**多条互异**行，
+      每行给出批次、**发货库位**与**正数数量**（同一单内 `(批次, 库位)`
+      必须互异，`422 DUPLICATE_SHIPMENT_LINE`）。整单确认时在**同一事务内**
+      逐行扣减对应**库位余额**与批次**全局余量**：发货严格从所给库位扣减、
+      **不做跨库位分配**，库位不存在 `404 LOCATION_NOT_FOUND`、该库位余额不足
+      `409 INSUFFICIENT_BALANCE`（即使全局余量充足也整单拒绝，details 带
+      `location_code`）；批次不存在 `404 SOURCE_NOT_FOUND`；发货单号已被占用
+      `409 SHIPMENT_NO_REUSED`。**隔离批次（含疑似）与已撤销产出不可发货**
+      （分别 `409 BATCH_QUARANTINED` / `409 BATCH_CANCELLED`）。任一不符
+      **整单拒绝、无部分变更**。
+    - **发货单查询** `GET /shipments/{发货单号}`：返回整单 `status`
+      （`SHIPPED` 全部未退 / `PARTIALLY_RETURNED` 有退回未全退 /
+      `FULLY_RETURNED` 全部行累计退回恰等于发出）、`shipped_at` 与逐行的
+      **发出量** `shipped_qty`、**累计退回量** `returned_qty`、**可退量**
+      `returnable_qty`（= 发出 − 累计退回）、行状态及单位；`returns` 数组
+      保留**逐次退货记录**（退货单号、退货时间与逐行退回量，按提交先后）。
+      单号不存在（失败提交不留记录）`404 SHIPMENT_NOT_FOUND`。
+    - **退货** `POST /returns`：凭**原发货单号**、**唯一退货单号**与若干
+      **原行号**（`line_no`，自 1 起，即查询响应中的逐行编号）的**正数
+      退回量**提交。同一退货单内原行号必须互异
+      （`422 DUPLICATE_RETURN_LINE`）；原发货单不存在
+      `404 SHIPMENT_NOT_FOUND`，原行号不存在 `404 SHIPMENT_LINE_NOT_FOUND`；
+      退货单号已被占用 `409 RETURN_NO_REUSED`。退货在**同一事务内**把数量
+      **原子返还到原批次、原库位**（库位与全局余量同步增加，各库位之和仍
+      等于全局余量）；任一原行**累计退回（含历次）不得超过其发出量**，
+      否则 `409 RETURN_EXCEEDS_SHIPPED`（details 给出 `requested` /
+      `shipped_qty` / `already_returned` / `returnable_qty`），整单拒绝、
+      不留退货记录。退货逐次**只追加**，全部记录可在发货单查询中查看。
+    - **隔离联动**：**发货后才隔离**的批次**仍可退货**——退货不校验隔离 /
+      撤销状态，返还到原批次原库位后该批次**继续隔离**（隔离只禁止再发货、
+      投料与分装；退货是售后入库而非新的使用）。
+    - **撤销联动**：生产产出**一旦发货，即使后来全部退回，也不得撤销原
+      生产单**（`409 OUTPUT_ALREADY_SHIPPED`，details 的 `shipment_nos`
+      列出相关发货单）；未发货产出的撤销条件不变。
+    - **并发**：发货与投料、分装、调拨、盘点同属库位扣减事务，沿用统一
+      两级加锁顺序——先按批次编号升序锁批次行，再按（批次, 库位编号）
+      锁库位行；退货先锁**原发货单头**串行化同单退货（杜绝超退），再按同一
+      全局顺序锁原批次与原库位。因此发货 / 退货 / 投料 / 分装 / 调拨 /
+      盘点 / 疑似标记 / 复核 / 撤销任意并发交错，两层余额恒等，绝不超扣或
+      超退；相同发货单号、退货单号并发时唯一约束兜底，恰好一笔成功。
+    - 幂等沿用既有 `Idempotency-Key` 规则：同键同体重放返回首次结果、
+      只扣 / 只返一次，同键异体 `409 IDEMPOTENCY_CONFLICT`，失败不固化可重试。
 
 ### 错误响应格式
 
@@ -259,7 +305,11 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 `TRANSFER_SAME_LOCATION`(422)、`TRANSFER_NO_REUSED`(409)、
 `DUPLICATE_STOCK_CHECK_LINE`(422)、`STOCK_CHECK_NO_LOSS`(422)、
 `STOCK_CHECK_NO_REUSED`(409)、`STOCK_CHECK_BOOK_CHANGED`(409)、
-`STOCK_CHECK_NOT_FOUND`(404)、`OUTPUT_HAS_STOCK_LOSS`(409)。
+`STOCK_CHECK_NOT_FOUND`(404)、`OUTPUT_HAS_STOCK_LOSS`(409)、
+`DUPLICATE_SHIPMENT_LINE`(422)、`SHIPMENT_NO_REUSED`(409)、
+`SHIPMENT_NOT_FOUND`(404)、`SHIPMENT_LINE_NOT_FOUND`(404)、
+`DUPLICATE_RETURN_LINE`(422)、`RETURN_NO_REUSED`(409)、
+`RETURN_EXCEEDS_SHIPPED`(409)、`OUTPUT_ALREADY_SHIPPED`(409)。
 
 ---
 
@@ -805,6 +855,142 @@ curl -i -X POST http://localhost:8080/productions/FG-1/cancellation \
 安全重试沿用统一语义：同一 `Idempotency-Key` + 同一请求体重放返回首次结果、
 差额只扣一次；同键异体返回 `409 IDEMPOTENCY_CONFLICT`。
 
+### 13. 客户发货与退货
+
+客户下单后，凭**唯一发货单号**一次提交多条互异的（批次, 库位）正数行；整单
+确认时原子扣减各库位与全局余量：
+
+```bash
+# 先准备两个批次并把部分库存调到 A-01 库位
+curl -X POST http://localhost:8080/raw-batches \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: raw-ship-001' \
+  -d '{"batch_no":"RM-1","unit":"kg","quantity":"100"}'
+curl -X POST http://localhost:8080/transfers \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: tr-ship-001' \
+  -d '{"transfer_no":"TR-1","batch_no":"RM-1",
+       "source_location":"DEFAULT","target_location":"A-01","quantity":40}'
+
+# 发货：DEFAULT 出 30、A-01 出 10
+curl -X POST http://localhost:8080/shipments \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: sh-20261001-01' \
+  -d '{
+        "shipment_no": "SH-20261001-01",
+        "lines": [
+          {"batch_no":"RM-1","location_code":"DEFAULT","quantity":30},
+          {"batch_no":"RM-1","location_code":"A-01","quantity":10}
+        ]
+      }'
+```
+
+```json
+{
+  "shipment_no": "SH-20261001-01",
+  "status": "SHIPPED",
+  "shipped_at": "2026-10-01T10:00:00+00:00",
+  "lines": [
+    {"line_no":1,"batch_no":"RM-1","location_code":"DEFAULT","unit":"kg",
+     "shipped_qty":30.0,"returned_qty":0.0,"returnable_qty":30.0,"status":"SHIPPED"},
+    {"line_no":2,"batch_no":"RM-1","location_code":"A-01","unit":"kg",
+     "shipped_qty":10.0,"returned_qty":0.0,"returnable_qty":10.0,"status":"SHIPPED"}
+  ],
+  "returns": []
+}
+```
+
+成功后 `RM-1` 全局余量与各库位同步扣减（`GET /batches/RM-1/locations`：
+DEFAULT 40 + A-01 30 = 70）。随时按单号查询逐行发出量、累计退回量、可退量：
+
+```bash
+curl http://localhost:8080/shipments/SH-20261001-01
+```
+
+客户退回部分货物时，凭**原发货单号** + **唯一退货单号** + **原行号**逐次退货；
+数量原子返还到**原批次、原库位**：
+
+```bash
+# 第一次退货：第 1 行退 10
+curl -X POST http://localhost:8080/returns \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: rt-20261002-01' \
+  -d '{"return_no":"RT-20261002-01","shipment_no":"SH-20261001-01",
+       "lines":[{"line_no":1,"quantity":10}]}'
+```
+
+```json
+{
+  "return_no": "RT-20261002-01",
+  "shipment_no": "SH-20261001-01",
+  "shipment_status": "PARTIALLY_RETURNED",
+  "returned_at": "2026-10-02T03:10:00+00:00",
+  "lines": [
+    {"line_no":1,"batch_no":"RM-1","location_code":"DEFAULT","unit":"kg",
+     "quantity":10.0,"returned_qty":10.0,"returnable_qty":20.0,
+     "status":"PARTIALLY_RETURNED"}
+  ]
+}
+```
+
+再把剩余可退量退完（第 1 行 20、第 2 行 10），发货单即转为 `FULLY_RETURNED`，
+库存完全还原（DEFAULT 70→100、A-01 30→40），两次退货记录都保留：
+
+```bash
+curl -X POST http://localhost:8080/returns \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: rt-20261003-01' \
+  -d '{"return_no":"RT-20261003-01","shipment_no":"SH-20261001-01",
+       "lines":[{"line_no":1,"quantity":20},{"line_no":2,"quantity":10}]}'
+
+curl http://localhost:8080/shipments/SH-20261001-01
+# "status":"FULLY_RETURNED"；逐行 returned_qty == shipped_qty、
+# returnable_qty == 0；returns 数组按时间先后列出 RT-20261002-01 / RT-20261003-01
+```
+
+整单拒绝示例（任一不符均不留单据、不改库存，同键可修正后重试）：
+
+```bash
+# 同单内（批次, 库位）重复：422 DUPLICATE_SHIPMENT_LINE
+# 发货单号重复：409 SHIPMENT_NO_REUSED
+# 批次不存在：404 SOURCE_NOT_FOUND
+# 发货库位不存在：404 LOCATION_NOT_FOUND（不自动建行）
+# 指定库位余额不足（即使全局余量充足）：409 INSUFFICIENT_BALANCE
+# 隔离批次（含疑似）发货：409 BATCH_QUARANTINED
+# 已撤销产出发货：409 BATCH_CANCELLED
+# 数量为 0/负数或空行：422 VALIDATION_ERROR
+
+# 退货原发货单不存在：404 SHIPMENT_NOT_FOUND
+# 退货原行号不存在：404 SHIPMENT_LINE_NOT_FOUND
+# 同单原行重复：422 DUPLICATE_RETURN_LINE
+# 累计退货超过原行发出量：
+#   409 {"error":{"code":"RETURN_EXCEEDS_SHIPPED",
+#     "details":{"shipment_no":"SH-20261001-01","line_no":1,
+#                "requested":"21","shipped_qty":"30.0000",
+#                "already_returned":"10.0000","returnable_qty":"20.0000"}}}
+# 退货单号重复：409 RETURN_NO_REUSED
+# 查询不存在的发货单：404 SHIPMENT_NOT_FOUND
+```
+
+**发货后才隔离**的批次仍可退货，返还后继续隔离；**一旦发货的生产产出即使全部
+退回也不得撤销**：
+
+```bash
+# FG-1 发货后来源批次才被标记疑似 -> FG-1 被连带隔离
+# 隔离状态下退货：201 成功，FG-1 返还后 is_quarantined 仍为 true
+curl -X POST http://localhost:8080/returns \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: rt-q-001' \
+  -d '{"return_no":"RT-Q-001","shipment_no":"SH-FG-001",
+       "lines":[{"line_no":1,"quantity":10}]}'
+
+# FG-1 曾发货（哪怕已全退）：撤销原生产单被拒
+curl -i -X POST http://localhost:8080/productions/FG-1/cancellation \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cancel-after-ship' \
+  -d '{"cancel_reason":"录入错误"}'
+# 409 {"error":{"code":"OUTPUT_ALREADY_SHIPPED",
+#   "details":{"batch_no":"FG-1","shipment_nos":["SH-FG-001"]}}}
+```
+
+写请求沿用统一幂等语义：同一 `Idempotency-Key` + 同一请求体重放返回首次结果、
+只扣 / 只返还一次；同键异体返回 `409 IDEMPOTENCY_CONFLICT`。
+
 ---
 
 ## 五、项目结构
@@ -818,17 +1004,21 @@ app/
                   # production_inputs(含申报库位) / production_input_locations
                   # (逐库位消耗明细) / stock_transfers(调拨单) /
                   # stock_checks + stock_check_lines(盘点单与逐行原值快照) /
+                  # shipments + shipment_lines(发货单与逐行快照) /
+                  # return_orders + return_order_lines(退货单与逐次退货追加) /
                   # batch_splits / batch_reviews / idempotency_keys
   schemas.py      # Pydantic 请求响应模型（正数/非负定点数、库位编号、调拨、
-                  # 非空撤销原因、分装校验、盘点校验）
-  errors.py       # 业务错误码（含 LOCATION_NOT_FOUND / TRANSFER_* / STOCK_CHECK_*）
+                  # 非空撤销原因、分装校验、盘点校验、发货/退货校验）
+  errors.py       # 业务错误码（含 LOCATION_NOT_FOUND / TRANSFER_* / STOCK_CHECK_*
+                  # / SHIPMENT_* / RETURN_* / OUTPUT_ALREADY_SHIPPED）
   service.py      # 核心逻辑：登记、库位调拨、按库位投料/分装、生产事务、
-                  # 按原消耗库位撤销返还、仓库盘点核销、幂等、递归谱系、
-                  # 污染传播、复核重算
-  routes.py       # HTTP 路由（含 /transfers、/stock-checks 与 /batches/{no}/locations）
+                  # 按原消耗库位撤销返还、仓库盘点核销、客户发货/退货、幂等、
+                  # 递归谱系、污染传播、复核重算
+  routes.py       # HTTP 路由（含 /transfers、/stock-checks、/shipments、/returns
+                  # 与 /batches/{no}/locations）
   main.py         # FastAPI 应用与异常处理
   entrypoint.py   # 容器入口：等待数据库 → 建表 → 启动
-tests/            # 端到端 + 并发测试（含盘点功能与盘点并发）
+tests/            # 端到端 + 并发测试（含发货/退货功能与发货退货并发）
 Dockerfile
 docker-compose.yml
 ```
@@ -883,6 +1073,18 @@ docker-compose.yml
   盘点与撤销交错时：盘点先落库的产出撤销被 `OUTPUT_HAS_STOCK_LOSS` 拒绝，
   撤销先落库时已撤销产出仍可核销（撤销不扣产出自身余额），结局等价于
   某一串行顺序，两层余额恒等。
+- **发货 / 退货并发**：发货与投料、分装、调拨、盘点同属库位扣减事务，先按
+  批次编号升序锁批次行、再按（批次, 库位编号）锁库位行，绝不超扣且两层恒等。
+  退货在同一全局加锁顺序之前先锁**原发货单头**：同一张发货单上的并发退货
+  严格串行，先到者在锁下完成“累计退回 ≤ 发出量”的校验与追加，后到者在锁后
+  读到新的累计值，超退即以 `RETURN_EXCEEDS_SHIPPED` 整单拒绝，累计退回绝不
+  超过原行发出量；退货按**原批次、原库位**返还，与调拨 / 发货 / 投料交错时
+  仍等价于某一串行顺序。与 QC 事务（疑似标记 / 复核 / 撤销）的互斥关系同
+  既有库存事务：经行锁与 QC 表锁串行化，发货与撤销不会同时成功
+  （发货先则撤销 `OUTPUT_ALREADY_SHIPPED`，撤销先则发货 `BATCH_CANCELLED`），
+  发货与疑似标记并发时标记先则发货被 `BATCH_QUARANTINED` 拒绝；发货后才
+  隔离不影响已成交发货，也不阻止其后的退货。相同发货单号 / 退货单号并发时
+  唯一约束兜底，恰好一笔成功。
 
 > 注：新表 `batch_splits`、`batch_reviews` 与 `productions` 表的撤销字段
 > （`is_cancelled` / `cancel_reason` / `cancelled_at`）随启动/入口的
@@ -910,3 +1112,16 @@ docker-compose.yml
 > 唯一的既有行为变化是撤销生产单新增一道校验——产出自身曾在盘点中盘亏
 > 时以 `OUTPUT_HAS_STOCK_LOSS`(409) 拒绝（此前不存在盘点记录，故既有
 > 数据不受影响）。
+>
+> 客户发货 / 退货同样为纯增量升级：新表 `shipments` / `shipment_lines`
+> （发货单头与逐行批次/库位/发出量/单位快照，单内 `(批次, 库位)` 互异、
+> 数量为正等唯一/CHECK 约束）、`return_orders` / `return_order_lines`
+> （退货单头与逐次退货追加行，单内原行互异、数量为正）由启动
+> `CREATE TABLE IF NOT EXISTS` 自动创建，不改动任何既有表与列；新接口
+> `/shipments`、`/returns` 为纯新增路由。既有全部接口的请求、响应字段、
+> 错误码与启动方式保持不变，唯一的既有行为变化是撤销生产单再增一道
+> 校验——产出批次一旦出现在任一发货行中（即曾发货），即使已全部退回也
+> 以 `OUTPUT_ALREADY_SHIPPED`(409) 拒绝（此前不存在发货记录，故既有
+> 数据不受影响）。批次查询的 `remaining_qty` 仍是全局余量，逐库位之和
+> 仍恒等于全局余量，`GET /batches`、`/batches/{no}/locations` 等既有
+> 接口字段与含义均未变化。

@@ -1,6 +1,8 @@
 """统一业务错误：携带稳定错误码，映射为 4xx 响应。"""
 from __future__ import annotations
 
+from decimal import Decimal
+
 
 class AppError(Exception):
     def __init__(self, code: str, message: str, status_code: int = 409, details=None):  # noqa: ANN001
@@ -235,4 +237,92 @@ def unit_mismatch(batch_no: str, expected: str, actual: str) -> AppError:
         "UNIT_MISMATCH",
         f"批次 {batch_no!r} 单位为 {expected!r}，与申报单位 {actual!r} 不一致",
         422,
+    )
+
+
+# ---------------------------------------------------------------- 发货 / 退货
+
+
+def duplicate_shipment_line(batch_no: str, location_code: str) -> AppError:
+    return AppError(
+        "DUPLICATE_SHIPMENT_LINE",
+        f"同一发货单中批次 {batch_no!r} 库位 {location_code!r} 重复出现，"
+        "各发货行（批次 + 库位）必须互异",
+        422,
+        details={"batch_no": batch_no, "location_code": location_code},
+    )
+
+
+def shipment_no_exists(shipment_no: str) -> AppError:
+    return AppError(
+        "SHIPMENT_NO_REUSED",
+        f"发货单号 {shipment_no!r} 已存在，发货单号不得复用",
+        409,
+        details={"shipment_no": shipment_no},
+    )
+
+
+def shipment_not_found(shipment_no: str) -> AppError:
+    return AppError(
+        "SHIPMENT_NOT_FOUND",
+        f"发货单 {shipment_no!r} 不存在",
+        404,
+        details={"shipment_no": shipment_no},
+    )
+
+
+def shipment_line_not_found(shipment_no: str, line_no: int) -> AppError:
+    return AppError(
+        "SHIPMENT_LINE_NOT_FOUND",
+        f"发货单 {shipment_no!r} 不存在行号 {line_no} 的发货行",
+        404,
+        details={"shipment_no": shipment_no, "line_no": line_no},
+    )
+
+
+def duplicate_return_line(line_no: int) -> AppError:
+    return AppError(
+        "DUPLICATE_RETURN_LINE",
+        f"同一退货单中原发货行 {line_no!r} 重复出现，每张退货单对每条原行只能退货一次",
+        422,
+        details={"line_no": line_no},
+    )
+
+
+def return_no_exists(return_no: str) -> AppError:
+    return AppError(
+        "RETURN_NO_REUSED",
+        f"退货单号 {return_no!r} 已存在，退货单号不得复用",
+        409,
+        details={"return_no": return_no},
+    )
+
+
+def return_exceeds_shipped(
+    shipment_no: str, line_no: int, requested: object, shipped: object, returned: object
+) -> AppError:
+    returnable = Decimal(shipped) - Decimal(returned)
+    return AppError(
+        "RETURN_EXCEEDS_SHIPPED",
+        f"发货单 {shipment_no!r} 第 {line_no} 行累计退货超出原行发出量："
+        f"本次请求 {requested}，已退 {returned}，可退 {returnable}",
+        409,
+        details={
+            "shipment_no": shipment_no,
+            "line_no": line_no,
+            "requested": str(requested),
+            "shipped_qty": str(shipped),
+            "already_returned": str(returned),
+            "returnable_qty": str(returnable),
+        },
+    )
+
+
+def output_already_shipped(batch_no: str, shipment_nos: list[str]) -> AppError:
+    return AppError(
+        "OUTPUT_ALREADY_SHIPPED",
+        f"生产产出 {batch_no!r} 已发货（发货单：{', '.join(sorted(shipment_nos))}），"
+        "一旦发货即使全部退回也不得撤销原生产单",
+        409,
+        details={"batch_no": batch_no, "shipment_nos": sorted(shipment_nos)},
     )
